@@ -308,7 +308,10 @@ LOGIN_HTML = """
 <div class="container py-5" style="max-width:400px;">
 <h2>Vorodrop - drop.voronet.net</h2>
 <br>
-<h6>To prevent abuse, only authenticated users can upload files over the internet.</h6>
+<h5>To prevent abuse, only authenticated users can upload files over the internet.</h5>
+<h6>If you do not know the password, or want significantly faster upload/download speeds, use drop.internal.voronet.net in the voronet network.</h6>
+<br>
+<br>
 <form method="post" action="/auth">
 <input type="password" name="password" class="form-control mb-3" placeholder="Enter Password">
 <button class="btn btn-primary w-100">Enter</button>
@@ -357,13 +360,14 @@ LOGIN_HTML = """
 </html>
 """
 
+internal_version_disclaimer = "- INTERNAL VERSION (drop.internal.voronet.net)" if SECURE_MODE else ""
 
 INDEX_HTML = """
 <!doctype html>
 <html data-bs-theme="dark">
 <head>
 <meta charset="utf-8">
-<title>Vorodrop - File Sharing</title>
+<title>Vorodrop - File Sharing %%DISCLAIMER%%</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
 </head>
 <body class="bg-dark text-light">
@@ -546,14 +550,14 @@ xhr.send(data);
   </div>
 </footer>
 </html>
-"""
+""".replace("%%DISCLAIMER%%", internal_version_disclaimer)
 
 DOWNLOAD_HTML = """
 <!doctype html>
 <html data-bs-theme="dark">
 <head>
 <meta charset="utf-8">
-<title>Download</title>
+<title>Download %%DISCLAIMER%%</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
 </head>
 <body class="bg-dark text-light">
@@ -637,10 +641,15 @@ DOWNLOAD_HTML = """
   </div>
 </footer>
 </html>
-"""
+""".replace("%%DISCLAIMER%%", internal_version_disclaimer)
 
 
 # ================= RUN =================
 
+# if __name__ == "__main__":
+#     app.run(host="0.0.0.0", port=80, debug=False)
+
+#production
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=80, debug=False)
+    from waitress import serve
+    serve(app, host="0.0.0.0", port=80)
