@@ -360,7 +360,7 @@ LOGIN_HTML = """
 </html>
 """
 
-internal_version_disclaimer = "- INTERNAL VERSION (drop.internal.voronet.net)" if SECURE_MODE else ""
+internal_version_disclaimer = "- INTERNAL VERSION (drop.internal.voronet.net)" if not SECURE_MODE else ""
 
 INDEX_HTML = """
 <!doctype html>
