@@ -7,19 +7,37 @@ import random
 import argparse
 import secrets
 import hmac
+import csv
 from datetime import datetime, timedelta
 from flask import Flask, request, render_template_string, send_file, abort, redirect, url_for, session, jsonify
 from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 # ================= CONFIG =================
-UPLOAD_ROOT = os.environ.get("UPLOAD_ROOT", "./uploads")
+UPLOAD_ROOT = os.environ.get("UPLOAD_ROOT", "/mnt/drop")
 MAX_FILE_SIZE = 4 * 1024 * 1024 * 1024  # 4GB
 CLEANUP_INTERVAL = 60
 UPLOAD_PASSWORD = b"test123"
 WORDLIST = ["sun", "moon", "river", "tree", "cloud", "stone", "shadow",
             "ember", "wolf", "falcon", "ocean", "storm", "forest",
             "night", "dawn", "echo", "flame", "wind"]
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+STATS_CSV = os.path.join(SCRIPT_DIR, "usage_statistics.csv")
+
+CSV_FIELDNAMES = [
+    "upload_time",
+    "ip",
+    "user_agent",
+    "filename",
+    "size_bytes",
+    "expiry_choice",
+    "expiry_datetime",
+    "folder_uuid",
+    "short_word",
+    "password_protected",
+    "download_count",
+]
 
 # ==========================================
 
@@ -37,6 +55,52 @@ os.makedirs(UPLOAD_ROOT, exist_ok=True)
 
 short_links = {}
 failed_attempts = {}
+
+# ================= CSV TELEMETRY =================
+
+def init_csv():
+    """Create the CSV file with headers if it doesn't already exist."""
+    if not os.path.exists(STATS_CSV):
+        with open(STATS_CSV, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
+            writer.writeheader()
+
+def log_upload(ip, user_agent, filename, size_bytes, expiry_choice, expiry_datetime, folder_uuid, short_word, password_protected):
+    """Append one row to usage_statistics.csv."""
+    row = {
+        "upload_time":       datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "ip":                ip,
+        "user_agent":        user_agent,
+        "filename":          filename,
+        "size_bytes":        size_bytes,
+        "expiry_choice":     expiry_choice,
+        "expiry_datetime":   expiry_datetime.strftime("%Y-%m-%d %H:%M:%S"),
+        "folder_uuid":       folder_uuid,
+        "short_word":        short_word,
+        "password_protected": "yes" if password_protected else "no",
+        "download_count":    0,
+    }
+    with open(STATS_CSV, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
+        writer.writerow(row)
+
+def increment_download_count(folder_uuid):
+    """Find the row matching folder_uuid and increment its download_count in-place."""
+    if not os.path.exists(STATS_CSV):
+        return
+    rows = []
+    with open(STATS_CSV, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row["folder_uuid"] == folder_uuid:
+                row["download_count"] = int(row.get("download_count", 0)) + 1
+            rows.append(row)
+    with open(STATS_CSV, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+
+init_csv()
 
 # ================= CLEANUP THREAD =================
 def cleanup_expired():
@@ -69,12 +133,15 @@ def generate_short_word():
 
 def expiration_from_choice(choice):
     mapping = {
-        "5m": timedelta(minutes=5),
-        "1h": timedelta(hours=1),
-        "6h": timedelta(hours=6),
+        "1m":  timedelta(minutes=1),
+        "5m":  timedelta(minutes=5),
+        "1h":  timedelta(hours=1),
+        "6h":  timedelta(hours=6),
         "24h": timedelta(hours=24),
-        "3d": timedelta(days=3),
-        "7d": timedelta(days=7),
+        "3d":  timedelta(days=3),
+        "7d":  timedelta(days=7),
+        "31d": timedelta(days=31),
+        "91d": timedelta(days=91),
     }
     return mapping.get(choice, timedelta(hours=24))
 
@@ -158,10 +225,21 @@ def upload():
     short_word = generate_short_word()
     short_links[short_word] = folder_uuid
 
-    remaining = expiry - datetime.utcnow()
-    total_seconds = int(remaining.total_seconds())
-    hours, remainder = divmod(total_seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
+    # ---- Telemetry ----
+    ip = request.remote_addr
+    user_agent = request.headers.get("User-Agent", "unknown")
+    log_upload(
+        ip=ip,
+        user_agent=user_agent,
+        filename=file.filename,
+        size_bytes=size,
+        expiry_choice=expiry_choice,
+        expiry_datetime=expiry,
+        folder_uuid=folder_uuid,
+        short_word=short_word,
+        password_protected=bool(password),
+    )
+    # -------------------
 
     return jsonify({
         "short_url": request.host_url + short_word,
@@ -211,6 +289,7 @@ def direct_download(folder_uuid):
         meta = json.load(f)
 
     file_path = os.path.join(folder_path, meta["filename"])
+    increment_download_count(folder_uuid)
     return send_file(file_path, as_attachment=True)
 
 @app.errorhandler(RequestEntityTooLarge)
@@ -298,12 +377,15 @@ INDEX_HTML = """
 <h6>Choose the amount of time to exist</h6>
 <div class="mb-3">
 <select class="form-select" name="expiry">
+<option value="1m">1 Minute</option>
 <option value="5m">5 Minutes</option>
 <option value="1h">1 Hour</option>
 <option value="6h">6 Hours</option>
 <option value="24h" selected>24 Hours</option>
 <option value="3d">3 Days</option>
 <option value="7d">1 Week</option>
+<option value="31d">1 Month</option>
+<option value="91d">1 Semester</option>
 </select>
 </div>
 <br>
@@ -327,12 +409,10 @@ INDEX_HTML = """
 <div class="progress-bar" role="progressbar" style="width: 0%">0%</div>
 </div>
 <div id="speed" class="mt-2"></div>
-<div id="result" class="mt-4"></div>
+<div id="result" class="mt-4">Large files may take a moment to process after uploading reaches 100%</div>
 </div>
 
 <script>
-
-
 
 document.getElementById("togglePassword").addEventListener("click", function() {
   const field = document.getElementById("passwordField");
@@ -359,8 +439,6 @@ form.addEventListener("submit", function(e) {
 const data = new FormData(form);
 const xhr = new XMLHttpRequest();
 xhr.open("POST", "/upload", true);
-
-
 
 let startTime = Date.now();
 document.querySelector(".progress").style.display = "block";
@@ -521,7 +599,6 @@ DOWNLOAD_HTML = """
 </script>
 
 </body>
-
 
 <footer class="mt-5 py-4 border-top border-secondary text-secondary" style="font-size: 0.8rem;">
   <div class="container">
