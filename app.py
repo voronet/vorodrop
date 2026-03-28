@@ -15,15 +15,27 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 # ================= CONFIG =================
 UPLOAD_ROOT = os.environ.get("UPLOAD_ROOT", "/mnt/drop")
+# UPLOAD_ROOT = os.environ.get("UPLOAD_ROOT", "D:\\git-repos\\vorodrop\\uploads") # debug
 MAX_FILE_SIZE = 4 * 1024 * 1024 * 1024  # 4GB
 CLEANUP_INTERVAL = 60
 UPLOAD_PASSWORD = b"test123"
-WORDLIST = ["sun", "moon", "river", "tree", "cloud", "stone", "shadow",
-            "ember", "wolf", "falcon", "ocean", "storm", "forest",
-            "night", "dawn", "echo", "flame", "wind"]
+WORDLIST = [
+    "sun", "moon", "river", "tree", "cloud", "stone", "shadow",
+    "ember", "wolf", "falcon", "ocean", "storm", "forest",
+    "night", "dawn", "echo", "flame", "wind", "peak", "vale",
+    "frost", "tide", "spark", "ridge", "hollow", "creek", "mist",
+    "cedar", "maple", "birch", "ash", "thorn", "fern", "moss",
+    "raven", "heron", "crane", "swift", "finch", "robin", "wren",
+    "comet", "nebula", "dune", "cliff", "marsh", "delta", "basin",
+    "amber", "slate", "cobalt", "crimson", "silver", "copper",
+    "anvil", "beacon", "brace", "crest", "drift", "flint", "gale",
+    "haven", "kelp", "latch", "mantle", "notch", "prism", "quill",
+    "resin", "sable", "taper", "umbra", "vault", "wither", "zenith",
+]
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STATS_CSV = os.path.join(SCRIPT_DIR, "usage_statistics.csv")
+LINKS_FILE = os.path.join(SCRIPT_DIR, "active_links.json")
 
 CSV_FIELDNAMES = [
     "upload_time",
@@ -53,39 +65,65 @@ app.wsgi_app = ProxyFix(app.wsgi_app)
 
 os.makedirs(UPLOAD_ROOT, exist_ok=True)
 
-short_links = {}
+short_links = {}         # word -> folder_uuid
+short_links_meta = {}    # word -> {"folder_uuid": ..., "expiry": isoformat, "filename": ...}
+short_links_lock = threading.Lock()
 failed_attempts = {}
+
+# ================= PERSISTENT LINKS =================
+
+def save_links():
+    """Write short_links_meta to disk. Must be called with short_links_lock held."""
+    tmp = LINKS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(short_links_meta, f, indent=2)
+    os.replace(tmp, LINKS_FILE)
+
+def load_links():
+    """Load active_links.json on startup, discarding already-expired entries."""
+    if not os.path.exists(LINKS_FILE):
+        return
+    with open(LINKS_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    now = datetime.utcnow()
+    loaded = 0
+    for word, info in data.items():
+        expiry = datetime.fromisoformat(info["expiry"])
+        if expiry > now:
+            short_links[word] = info["folder_uuid"]
+            short_links_meta[word] = info
+            loaded += 1
+    print(f"[links] Loaded {loaded} active link(s) from {LINKS_FILE}")
+
+load_links()
 
 # ================= CSV TELEMETRY =================
 
 def init_csv():
-    """Create the CSV file with headers if it doesn't already exist."""
     if not os.path.exists(STATS_CSV):
         with open(STATS_CSV, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
             writer.writeheader()
 
 def log_upload(ip, user_agent, filename, size_bytes, expiry_choice, expiry_datetime, folder_uuid, short_word, password_protected):
-    """Append one row to usage_statistics.csv."""
     row = {
-        "upload_time":       datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-        "ip":                ip,
-        "user_agent":        user_agent,
-        "filename":          filename,
-        "size_bytes":        size_bytes,
-        "expiry_choice":     expiry_choice,
-        "expiry_datetime":   expiry_datetime.strftime("%Y-%m-%d %H:%M:%S"),
-        "folder_uuid":       folder_uuid,
-        "short_word":        short_word,
+        "upload_time":        datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "ip":                 ip,
+        "user_agent":         user_agent,
+        "filename":           filename,
+        "size_bytes":         size_bytes,
+        "expiry_choice":      expiry_choice,
+        "expiry_datetime":    expiry_datetime.strftime("%Y-%m-%d %H:%M:%S"),
+        "folder_uuid":        folder_uuid,
+        "short_word":         short_word,
         "password_protected": "yes" if password_protected else "no",
-        "download_count":    0,
+        "download_count":     0,
     }
     with open(STATS_CSV, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
         writer.writerow(row)
 
 def increment_download_count(folder_uuid):
-    """Find the row matching folder_uuid and increment its download_count in-place."""
     if not os.path.exists(STATS_CSV):
         return
     rows = []
@@ -103,6 +141,7 @@ def increment_download_count(folder_uuid):
 init_csv()
 
 # ================= CLEANUP THREAD =================
+
 def cleanup_expired():
     while True:
         now = datetime.utcnow()
@@ -118,18 +157,29 @@ def cleanup_expired():
                         for file in os.listdir(folder_path):
                             os.remove(os.path.join(folder_path, file))
                         os.rmdir(folder_path)
-                    except:
+                    except Exception:
                         pass
+                    # Evict from short_links so word returns to the pool
+                    with short_links_lock:
+                        words_to_remove = [w for w, uid in short_links.items() if uid == folder]
+                        for w in words_to_remove:
+                            del short_links[w]
+                            short_links_meta.pop(w, None)
+                        if words_to_remove:
+                            save_links()
         time.sleep(CLEANUP_INTERVAL)
 
 threading.Thread(target=cleanup_expired, daemon=True).start()
 
 # ================= UTIL =================
+
 def generate_short_word():
-    while True:
-        word = random.choice(WORDLIST)
-        if word not in short_links:
-            return word
+    """Return a word from WORDLIST not currently in use. Raises RuntimeError if pool exhausted."""
+    with short_links_lock:
+        available = [w for w in WORDLIST if w not in short_links]
+        if not available:
+            raise RuntimeError("Short-word pool exhausted")
+        return random.choice(available)
 
 def expiration_from_choice(choice):
     mapping = {
@@ -169,17 +219,15 @@ def index():
 @app.route("/auth", methods=["POST"])
 def auth():
     ip = request.remote_addr
-
     if rate_limited(ip):
         return "Too many attempts. Try later.", 429
-
     password = request.form.get("password", "")
     if constant_time_check(password):
         session["authenticated"] = True
         return redirect("/")
     else:
         record_failure(ip)
-        time.sleep(1)  # slow brute force
+        time.sleep(1)
         return render_template_string(LOGIN_HTML, error="Wrong password")
 
 @app.route("/upload", methods=["POST"])
@@ -198,6 +246,11 @@ def upload():
     if len(request.files) > 1:
         return "Only one file allowed", 400
 
+    try:
+        short_word = generate_short_word()
+    except RuntimeError:
+        return jsonify({"error": "No short-word slots available. Try again later."}), 503
+
     folder_uuid = str(uuid.uuid4())
     folder_path = os.path.join(UPLOAD_ROOT, folder_uuid)
     os.makedirs(folder_path)
@@ -209,23 +262,28 @@ def upload():
     expiry_choice = request.form.get("expiry", "24h")
     expiry = datetime.utcnow() + expiration_from_choice(expiry_choice)
 
-    password = request.form.get("password")
-    password = password if password else None
+    password = request.form.get("password") or None
 
     meta = {
         "filename": file.filename,
         "size": size,
         "expiry": expiry.isoformat(),
-        "password": password
+        "password": password,
     }
-
     with open(os.path.join(folder_path, "meta.json"), "w") as f:
         json.dump(meta, f)
 
-    short_word = generate_short_word()
-    short_links[short_word] = folder_uuid
+    # Register link atomically and persist
+    with short_links_lock:
+        short_links[short_word] = folder_uuid
+        short_links_meta[short_word] = {
+            "folder_uuid": folder_uuid,
+            "expiry": expiry.isoformat(),
+            "filename": file.filename,
+        }
+        save_links()
 
-    # ---- Telemetry ----
+    # Telemetry
     ip = request.remote_addr
     user_agent = request.headers.get("User-Agent", "unknown")
     log_upload(
@@ -239,7 +297,6 @@ def upload():
         short_word=short_word,
         password_protected=bool(password),
     )
-    # -------------------
 
     return jsonify({
         "short_url": request.host_url + short_word,
@@ -251,9 +308,11 @@ def upload():
 
 @app.route("/<word>")
 def short_download(word):
-    if word not in short_links:
+    with short_links_lock:
+        folder_uuid = short_links.get(word)
+    if folder_uuid is None:
         abort(404)
-    return redirect(url_for("download_page", folder_uuid=short_links[word]))
+    return redirect(url_for("download_page", folder_uuid=folder_uuid))
 
 @app.route("/file/<folder_uuid>", methods=["GET", "POST"])
 def download_page(folder_uuid):
@@ -653,3 +712,4 @@ DOWNLOAD_HTML = """
 if __name__ == "__main__":
     from waitress import serve
     serve(app, host="0.0.0.0", port=80)
+    # app.run(host="0.0.0.0", port=444, debug=False)
